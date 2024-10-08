@@ -1,0 +1,122 @@
+# 私仓地址
+image: xxx/rockylinux-envsubst-stk:v0.0.1
+variables:
+  AUTO_DEPLOY_ENV: "test"
+  # gitlab域名
+  GITLAB_ADDRESS: "https://gitlab-xxx.com"
+  # nacos最终YML文件归档项目ID
+  GITLAB_ARCHIVE_PROJECT_ID: "84"
+  NACOS_DEVOPS_USERNAME: "devops"
+  
+stages:
+  - envsubst
+  - archive
+  - deploy
+
+
+envsubst:
+  stage: envsubst
+  tags:
+    - sre
+  script:
+    - MODIFIED_FILES=$(git diff --name-only HEAD HEAD~1 | xargs -I {} echo {})
+    - echo $MODIFIED_FILES
+    # ENCRYPT_KEY是环境变量，stk工具的加解密密钥
+    - KEY=`echo ${ENCRYPT_KEY}|base64 -d`
+    - |-
+      for file in $MODIFIED_FILES
+      do
+        if [ `echo $file|grep ^nacos|grep -v common|wc -l` -eq 1 ];then
+          full_filename=`basename $file`
+          filename=`echo $full_filename|cut -d "." -f 1`
+          for full_path in `find nacos/overlays/ -mindepth 1 -maxdepth 1 -type d`
+          do
+            dir=$(basename $full_path)
+            # 将env下的common.yml转换为环境变量
+            if [ -f "$full_path/common.yml" ];then
+              stk convert yamlfile -f $full_path/common.yml -r $full_path/export_common.sh 
+              source $full_path/export_common.sh
+            fi
+
+            # 将env下的common_secret.yml解密并转换为环境变量
+            if [ -f "$full_path/common_secret.yml" ];then
+              stk convert file --key ${KEY} --encrypt false --filename-list $full_path/common_secret.yml --output false --file-type file
+              stk convert yamlfile -f $full_path/common_secret.yml.new -r $full_path/export_common_secret.sh 
+              source $full_path/export_common_secret.sh 
+            fi
+
+            # 将env下对应变动的微服务common.yml转换为环境变量
+            if [ -f "$full_path/$filename/common.yml" ];then
+              stk convert yamlfile -f $full_path/$filename/common.yml -r $full_path/$filename/export_common.sh 
+              source $full_path/$filename/export_common.sh 
+            fi
+
+            # 将env下对应变动的微服务common_secret.yml解密并转换为环境变量
+            if [ -f "$full_path/$filename/common_secret.yml" ];then
+              stk convert file --key ${KEY} --encrypt false --filename-list $full_path/$filename/common_secret.yml --output false --file-type file
+              stk convert yamlfile -f $full_path/$filename/common_secret.yml.new -r $full_path/$filename/export_common_secret.sh 
+              source $full_path/$filename/export_common_secret.sh 
+            fi            
+
+            mkdir -p archive/$dir
+            envsubst <$file >archive/$dir/$full_filename
+          done
+        fi
+      done
+  artifacts:
+    paths:
+      - archive
+    expire_in: "1 days"
+
+
+archive:
+  stage: archive
+  tags:
+    - sre
+  script:
+    - |-
+      if [ -d archive ]; then
+        filename_list=`find archive -type f|xargs|sed 's/ /,/g'`
+        stk update gitlab --gitlab-addr ${GITLAB_ADDRESS} --gitlab-project-id ${GITLAB_ARCHIVE_PROJECT_ID} \
+        --gitlab-project-branch ${CI_COMMIT_BRANCH} --gitlab-token ${ARCHIVE_TOKEN} \
+        --gitlab-filename-list ${filename_list} --gitlab-commit-username "${CI_COMMIT_AUTHOR}"
+      else
+        echo skip 
+      fi
+
+deploy:
+ stage: deploy
+ tags:
+   - sre
+ script:
+   - |-
+     nacos_pwd=`echo ${NACOS_DEVOPS_PASSWD}|base64 -d`
+     if [ -d archive ]; then
+       for dir in `find archive -mindepth 1 -type d`
+       do
+         env=`basename $dir`
+         # 判断这个环境是否允许自动更新
+         if [ `echo ${AUTO_DEPLOY_ENV}|grep $env|wc -l` -eq 1 ];then
+           filename_list=`find $dir -type f|xargs|sed 's/ /,/g'`
+           case $env in
+             test)
+                 nacos_address="nacos-test.xxx.com"
+                 nacos_namespace="test"
+                 ;;
+             *)
+                 echo "错误的环境目录定义"
+                 continue
+                 ;;
+           esac
+
+           stk update nacos --nacos-addr ${nacos_address} \
+           --nacos-addr-scheme https --nacos-ns-id ${nacos_namespace} --nacos-username ${NACOS_DEVOPS_USERNAME} \
+           --nacos-passwd ${nacos_pwd} --nacos-filename-list ${filename_list}
+         else
+           echo "$env环境不允许自动更新"
+         fi
+       done
+     else
+       echo skip
+     fi
+

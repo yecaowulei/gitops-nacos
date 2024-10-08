@@ -1,0 +1,12 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    host: ${spring_datasource_host}
+    username: ${spring_datasource_username}
+    password: ${spring_datasource_password}
+
+# 开关
+switch:
+  permission: ${switch_permission}

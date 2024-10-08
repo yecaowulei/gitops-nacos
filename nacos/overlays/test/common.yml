@@ -1,0 +1,4 @@
+spring:
+  datasource:
+    host: xxx:3306
+    username: test
